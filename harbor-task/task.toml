@@ -1,0 +1,19 @@
+schema_version = "1.4"
+artifacts = ["/var/lib/haircut/run-6.json", "/var/lib/haircut/run-6.html"]
+
+[agent]
+timeout_sec = 1800
+
+[verifier]
+timeout_sec = 30
+environment_mode = "shared"
+
+[environment]
+build_timeout_sec = 600
+cpus = 2
+memory_mb = 4096
+
+[[environment.mcp_servers]]
+name = "haircut"
+transport = "stdio"
+command = "/usr/local/bin/haircut-mcp"

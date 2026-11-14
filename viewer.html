@@ -1,0 +1,901 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Haircut</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1d23; color: #e8e8e8;
+               font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+  #hud { position: fixed; top: 12px; left: 14px; white-space: pre; pointer-events: none; text-shadow: 0 1px 2px #000; }
+  #hud small { color: #aab3bd; }
+  #hud b { color: #ff6b6b; }
+  #feeds { position: fixed; right: 14px; bottom: 50px; width: min(300px, 37vw, 47vh); display: grid;
+           gap: 8px; pointer-events: none; }
+  #feeds[hidden] { display: none; }
+  .feed { aspect-ratio: 4 / 3; box-sizing: border-box; border: 1px solid #8a94a0;
+          padding: 2px 6px; font-size: 12px; text-shadow: 0 1px 2px #000; }
+  #view-label { position: fixed; right: 14px; top: 12px; text-shadow: 0 1px 2px #000; pointer-events: none; }
+  #bar { position: fixed; bottom: 12px; left: 14px; right: 14px; display: flex; gap: 10px; align-items: center; }
+  #t { flex: 1; }
+  button { font: inherit; padding: 2px 10px; }
+</style>
+</head>
+<body>
+<div id="hud"></div>
+<div id="feeds"><div class="feed" id="orbit-feed">Orbit camera</div><div class="feed" id="blade-feed">Blade camera</div></div>
+<div id="view-label" hidden></div>
+<div id="bar"><button id="play"></button><input id="t" type="range" min="0" value="0" aria-label="step"></div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// haircut.py fills this in for a replay: {grid, cells, reach, target, frames}.
+// Left as null, the page is live: it asks the `serve` process for the state and sends it actions.
+// All rules and rewards live in Python. This file draws, and animates hair for looks only.
+const EMBED = /*REPLAY*/null;
+const HEAD_SCAN = /*HEAD_SCAN*/"";
+const CAPTURE = EMBED === null && new URLSearchParams(location.search).has('capture');
+const LIVE = EMBED === null && !CAPTURE;
+const R = EMBED ?? await (await fetch('/state')).json();
+
+const V = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
+const UP = V(0, 1, 0), FLOOR = -2.75, CAPE_C = V(0, -2.08, -0.19), CAPE_R = V(2.02, 0.72, 1.18);
+const SEG = 10, CSEG = 3, SPEED = 8; // segments per guide and per clipping; replay steps per second
+const rnd = (k = 1) => (Math.random() - 0.5) * 2 * k;
+const std = (color, roughness = 0.5, metalness = 0) => new THREE.MeshStandardMaterial({ color, roughness, metalness });
+
+// ---------- scene ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1d23);
+scene.fog = new THREE.Fog(0x1a1d23, 11, 26);
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(3.1, 1.35, 6.0);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.6;
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.04, -0.25);
+controls.enableDamping = true;
+const sun = new THREE.DirectionalLight(0xffeee1, 2.05);
+sun.position.set(3, 5, 6);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -5, right: 5, top: 5, bottom: -5, near: 1, far: 24 });
+sun.shadow.camera.updateProjectionMatrix();
+sun.shadow.bias = -0.0005;
+sun.shadow.normalBias = 0.012;
+scene.add(sun);
+const rim = new THREE.DirectionalLight(0x9db8ff, 0.9); // cool light from behind, to lift the silhouette
+rim.position.set(-4, 3, -5);
+scene.add(rim);
+
+// ---------- head and scalp ----------
+const ROWS = R.grid.length - 1, COLS = R.grid[0].length;
+function radiusAt(d, rows, cols, sample) {
+  const u = Math.acos(THREE.MathUtils.clamp(d.y, -1, 1)) / Math.PI * rows;
+  const v = (Math.atan2(d.x, d.z) / (2 * Math.PI) + 1) % 1 * cols;
+  const i = Math.min(Math.floor(u), rows - 1), j = Math.floor(v) % cols, j1 = (j + 1) % cols;
+  return THREE.MathUtils.lerp(
+    THREE.MathUtils.lerp(sample(i, j), sample(i, j1), v - j),
+    THREE.MathUtils.lerp(sample(i + 1, j), sample(i + 1, j1), v - j), u - i);
+}
+const simSample = (i, j) => R.grid[i][j];
+const skinAt = d => radiusAt(d, ROWS, COLS, simSample);
+const cellDirs = R.cells.map(c => V(...c));
+function groomCell(d) { // extend the nearest cut cell to the natural hairline
+  let best = -1, most = -Infinity;
+  cellDirs.forEach((c, i) => { const t = c.dot(d); if (t >= most) { most = t; best = i; } });
+  return best;
+}
+
+const smooth = THREE.MathUtils.smoothstep;
+const tmp = V();
+const BUZZ_SCALE = 0.55;
+
+function hairline(n) {
+  // Temples sit higher than the center of the forehead, and the sides clear the ears.
+  const front = smooth(n.z, 0.25, 0.82);
+  const side = smooth(Math.abs(n.x), 0.20, 0.90);
+  const edge = -0.23 + 0.60 * front + 0.27 * side * (0.7 + 0.3 * front);
+  const overEar = 0.22 * smooth(Math.abs(n.x), 0.75, 0.96) * (1 - smooth(Math.abs(n.z + 0.04), 0.07, 0.40));
+  return n.y - edge - overEar + 0.006 * Math.sin(53 * n.x + 18 * n.z);
+}
+
+// Fit the crown and back to the simulator while leaving the scan's temples and ears intact.
+const { scene: portrait } = await new GLTFLoader().loadAsync(HEAD_SCAN || './assets/head-scan.glb');
+// The bundled profile stores the outer surface of the aligned scan as little-endian radii.
+const profile = portrait.userData.scalpProfile;
+const scanRadii = Uint8Array.from(atob(profile.radii), c => c.charCodeAt(0));
+function scanSample(i, j) {
+  const k = 2 * (i * profile.cols + j);
+  return (scanRadii[k] + 256 * scanRadii[k + 1]) / profile.scale;
+}
+function crownFit(n) {
+  const crown = smooth(n.y, 0.40, 0.80);
+  const back = (1 - smooth(n.z, -0.80, -0.25)) * smooth(n.y, -0.35, 0.22);
+  return 0.75 * Math.max(crown, back);
+}
+function portraitRadius(n) {
+  const scan = radiusAt(n, profile.rows, profile.cols, scanSample);
+  return scan > 0 ? THREE.MathUtils.lerp(scan, skinAt(n), crownFit(n)) : skinAt(n);
+}
+const on = (x, y, z) => { const d = V(x, y, z).normalize(); return d.multiplyScalar(portraitRadius(d)); };
+const model = portrait.children[0];
+const skinGeo = model.geometry;
+const skinPos = skinGeo.attributes.position;
+const scalpWeights = [], scalpLengths = Array(R.cells.length).fill(-1);
+const colors = new Float32Array(skinPos.count * 3).fill(1);
+const n = V(), scanPoint = V();
+for (let i = 0; i < skinPos.count; i++) {
+  scanPoint.fromBufferAttribute(skinPos, i);
+  scanPoint.set((scanPoint.x + 0.09) * 0.48, (scanPoint.y - 1.49) * 0.416, (scanPoint.z - 0.25) * 0.47);
+  n.copy(scanPoint).normalize();
+  const edge = hairline(n);
+  const fit = crownFit(n);
+  if (fit > 0) scanPoint.lerp(tmp.copy(n).multiplyScalar(skinAt(n)), fit);
+  skinPos.setXYZ(i, scanPoint.x, scanPoint.y, scanPoint.z);
+  const cell = groomCell(n);
+  if (edge > 0) scalpWeights.push({ i, cell, weight: smooth(edge, 0, 0.09) });
+}
+skinGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3).setUsage(THREE.DynamicDrawUsage));
+skinGeo.computeVertexNormals();
+skinGeo.computeBoundingSphere();
+model.material.vertexColors = true;
+model.material.onBeforeCompile = shader => {
+  shader.vertexShader = 'varying vec3 scanPosition;\n' + shader.vertexShader.replace('#include <begin_vertex>',
+    '#include <begin_vertex>\nscanPosition = position;');
+  shader.fragmentShader = 'varying vec3 scanPosition;\n' + shader.fragmentShader.replace('#include <color_fragment>',
+    `#include <color_fragment>
+     float neckline = -1.29 + 0.13 * smoothstep(0.06, 0.65, abs(scanPosition.x));
+     float edge = scanPosition.y - neckline;
+     float fabric = 1.0 - smoothstep(-0.012, 0.006, edge);
+     float trim = fabric * smoothstep(-0.060, -0.034, edge);
+     vec3 cloth = mix(vec3(0.023, 0.035, 0.053), vec3(0.64, 0.62, 0.57), trim);
+     diffuseColor.rgb = mix(diffuseColor.rgb, cloth, fabric);`);
+};
+model.castShadow = model.receiveShadow = true;
+scene.add(portrait);
+
+function shadeScalp(lengths) {
+  if (lengths.every((length, i) => length === scalpLengths[i])) return;
+  const color = skinGeo.attributes.color;
+  for (const { i, cell, weight } of scalpWeights) {
+    if (lengths[cell] === scalpLengths[cell]) continue;
+    const density = weight * smooth(lengths[cell], 0.001, 0.090);
+    color.setXYZ(i, 1 - 0.89 * density, 1 - 0.91 * density, 1 - 0.92 * density);
+  }
+  lengths.forEach((length, i) => { scalpLengths[i] = length; });
+  color.needsUpdate = true;
+}
+
+const headGeo = new THREE.IcosahedronGeometry(1, 42);
+headGeo.deleteAttribute('normal');
+headGeo.deleteAttribute('uv');
+const surface = mergeVertices(headGeo);
+headGeo.dispose();
+const head = new THREE.Mesh(surface, new THREE.MeshBasicMaterial()); // click target; the portrait is what you see
+for (let i = 0; i < surface.attributes.position.count; i++) {
+  n.fromBufferAttribute(surface.attributes.position, i).normalize();
+  n.multiplyScalar(skinAt(n));
+  surface.attributes.position.setXYZ(i, n.x, n.y, n.z);
+}
+
+// Target layer (T): a faint shell at the target length above the scalp.
+let shell = null;
+if (R.target > 0) {
+  const P = surface.attributes.position, index = surface.index.array, pos = new Float32Array(P.count * 3), hairy = new Uint8Array(P.count), v = V(), keep = [];
+  for (let i = 0; i < P.count; i++) {
+    v.fromBufferAttribute(P, i);
+    const d = tmp.copy(v).normalize();
+    hairy[i] = hairline(d) > 0;
+    v.setLength(portraitRadius(d) + R.target * BUZZ_SCALE).toArray(pos, i * 3);
+  }
+  for (let t = 0; t < index.length; t += 3) if (hairy[index[t]] && hairy[index[t + 1]] && hairy[index[t + 2]]) keep.push(index[t], index[t + 1], index[t + 2]);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setIndex(keep);
+  shell = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0x7fd7ff, transparent: true, opacity: 0.25, depthWrite: false, side: THREE.DoubleSide }));
+  shell.visible = false;
+  scene.add(shell);
+}
+
+// ---------- body and room ----------
+function part(geo, mat, pos, scale, parent = scene) {
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.copy(pos);
+  if (scale) mesh.scale.copy(scale);
+  mesh.castShadow = mesh.receiveShadow = true;
+  parent.add(mesh);
+  return mesh;
+}
+const ball = new THREE.SphereGeometry(1, 32, 20);
+part(ball, std(0x2a3542, 0.95), CAPE_C, CAPE_R);                                                // barber's cape
+
+const tile = document.createElement('canvas');
+tile.width = tile.height = 128;
+const ink = tile.getContext('2d');
+ink.fillStyle = '#34373e'; ink.fillRect(0, 0, 128, 128);
+ink.fillStyle = '#25282e'; ink.fillRect(0, 0, 64, 64); ink.fillRect(64, 64, 64, 64);
+const tiles = new THREE.CanvasTexture(tile);
+tiles.wrapS = tiles.wrapT = THREE.RepeatWrapping;
+tiles.repeat.set(24, 24);
+tiles.colorSpace = THREE.SRGBColorSpace;
+tiles.anisotropy = 8;
+const floor = new THREE.Mesh(new THREE.CircleGeometry(30, 64), new THREE.MeshStandardMaterial({ map: tiles, roughness: 0.85 }));
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = FLOOR;
+floor.receiveShadow = true;
+scene.add(floor);
+
+// ---------- hair: a sparse guide simulation drives a dense coat on the GPU ----------
+const tangent = (v, n) => v.addScaledVector(n, -v.dot(n)); // drop the part of v along n
+const uncut = R.frames[0].len;
+const guides = [], byCell = R.cells.map(() => []);
+let groomSeed = 271828; // stable roots, color and grooming across reloads
+const groomRandom = () => ((groomSeed = (Math.imul(groomSeed, 1664525) + 1013904223) >>> 0) / 2 ** 32);
+const jitter = width => (2 * groomRandom() - 1) * width;
+function rootDirections(count, scatter, visit) {
+  for (let i = 0; i < count; i++) {
+    const y = 1 - 2 * (i + 0.5) / count, r = Math.sqrt(1 - y * y), phi = i * 2.399963;
+    const n = V(Math.cos(phi) * r + jitter(scatter), y + jitter(scatter), Math.sin(phi) * r + jitter(scatter)).normalize();
+    if (hairline(n) > 0.018 * groomRandom()) visit(n, groomCell(n));
+  }
+}
+function addGuide(n, cell) {
+  // An off-center part separates the front into two swept sections.
+  const front = smooth(n.z, 0.12, 0.78);
+  const part = -0.25 - 0.12 * n.z;
+  const side = n.x < part ? -1 : 1;
+  const lay = tangent(V(side * (0.40 + 0.76 * front), -0.62 + 0.53 * front, -0.32 - 0.22 * front), n).normalize();
+  const across = V().crossVectors(n, lay);
+  const wave = 0.13 + groomRandom() * 0.14;
+  const phase = n.x * 10 + n.z * 6;
+  const rest = Array.from({ length: SEG }, (_, i) => {
+    const t = (i + 0.5) / SEG;
+    return lay.clone()
+      .addScaledVector(n, 0.24 * Math.exp(-6 * t) + 0.11 * Math.sin(8 * t + phase))
+      .addScaledVector(UP, -1.12 * smooth(t, 0.06, 0.86))
+      .addScaledVector(across, wave * Math.sin(10 * t + phase) * smooth(t, 0.0, 0.46)).normalize();
+  });
+  const groomLength = 1.48 + 0.25 * n.y - 0.24 * front - 0.17 * n.z + 0.17 * Math.sin(7 * n.x + 4 * n.z);
+  const stub = n.clone().addScaledVector(lay, 0.24).normalize();
+  const s = {
+    cell, n, rest, stub, groomLength, i: guides.length, root: n.clone().multiplyScalar(portraitRadius(n) - 0.002),
+    shade: 0.82 + groomRandom() * 0.42, p: Array.from({ length: SEG + 1 }, () => V()),
+    o: Array.from({ length: SEG + 1 }, () => V()), L: 0, still: 0, dirty: true,
+  };
+  guides.push(s);
+  byCell[cell].push(s);
+}
+rootDirections(1350, 0.010, addGuide);
+for (let i = 0; i < byCell.length; i++) if (!byCell[i].length) addGuide(cellDirs[i], i);
+
+const BROWN = new THREE.Color(0x291b16), GREEN = new THREE.Color(0x3ddc84), RED = new THREE.Color(0xff4d4d), col = new THREE.Color();
+let tint = false;
+const strandGeo = new THREE.CylinderGeometry(0.0045, 0.0065, 1, 5).translate(0, 0.5, 0);
+const hairMat = std(0xffffff, 0.5);
+const m = new THREE.Matrix4(), q = new THREE.Quaternion(), sc = V(), a = V(), dir = V(), nrm = V();
+const ONE = V(1, 1, 1);
+
+// Positions relative to the root and smoothed tangents, packed into two texels per node.
+const curveWidth = (SEG + 1) * 2;
+const curveData = new Float32Array(curveWidth * guides.length * 4);
+const curveMap = new THREE.DataTexture(curveData, curveWidth, guides.length, THREE.RGBAFormat, THREE.FloatType);
+const fibers = [];
+const roots = [], rotations = [], styles = [], rows = [], normals = [];
+rootDirections(41000, 0.0035, (n, cell) => {
+  let best = -Infinity, guide;
+  for (const g of byCell[cell]) {
+    const dot = g.n.dot(n);
+    if (dot > best) { best = dot; guide = g; }
+  }
+  const root = n.clone().multiplyScalar(portraitRadius(n) - 0.002);
+  const flyaway = groomRandom() < 0.04;
+  normals.push(n.x, n.y, n.z);
+  roots.push(root.x, root.y, root.z);
+  rotations.push(...q.setFromUnitVectors(guide.n, n).toArray());
+  styles.push(0.0022 + groomRandom() * 0.0014, 0.97 + jitter(flyaway ? 0.16 : 0.055), jitter(flyaway ? 0.10 : 0.028), jitter(flyaway ? 0.09 : 0.026));
+  rows.push((guide.i + 0.5) / guides.length);
+  fibers.push({ cell, shade: guide.shade * (0.78 + groomRandom() * 0.44) });
+});
+const fiberGeo = new THREE.InstancedBufferGeometry();
+const rings = [], indices = [], sides = 3;
+for (let i = 0; i <= SEG; i++) for (let j = 0; j < sides; j++) {
+  const angle = 2 * Math.PI * j / sides;
+  rings.push(Math.cos(angle), Math.sin(angle), i);
+  if (i < SEG) {
+    const x = i * sides + j, y = i * sides + (j + 1) % sides;
+    indices.push(x, y, x + sides, y, y + sides, x + sides);
+  }
+}
+fiberGeo.setAttribute('position', new THREE.Float32BufferAttribute(rings, 3));
+fiberGeo.setIndex(indices);
+for (const [key, data, size] of [['fiberRoot', roots, 3], ['fiberRotation', rotations, 4], ['fiberStyle', styles, 4], ['fiberRow', rows, 1], ['fiberNormal', normals, 3]]) {
+  fiberGeo.setAttribute(key, new THREE.InstancedBufferAttribute(new Float32Array(data), size));
+}
+fiberGeo.instanceCount = fibers.length;
+const tints = new THREE.InstancedBufferAttribute(new Float32Array(fibers.length * 3), 3);
+fiberGeo.setAttribute('color', tints);
+
+const fiberSource = /* glsl */ `
+  uniform sampler2D hairCurves;
+  attribute vec3 fiberRoot;
+  attribute vec4 fiberRotation;
+  attribute vec4 fiberStyle;
+  attribute float fiberRow;
+  attribute vec3 fiberNormal;
+  vec3 rotateFiber(vec3 p) {
+    vec3 q = fiberRotation.xyz;
+    return p + 2.0 * cross(q, cross(q, p) + fiberRotation.w * p);
+  }
+  void fiberVertex(out vec3 point, out vec3 normal) {
+    float node = position.z * 2.0;
+    vec4 curve = texture2D(hairCurves, vec2((node + 0.5) / ${curveWidth}.0, fiberRow));
+    if (curve.w < 0.5) { point = fiberRoot; normal = vec3(0., 1., 0.); return; }
+    vec4 frame = texture2D(hairCurves, vec2((node + 1.5) / ${curveWidth}.0, fiberRow));
+    vec3 along = rotateFiber(frame.xyz);
+    vec3 across = cross(along, fiberNormal);
+    if (dot(across, across) < 0.003) across = cross(along, abs(along.y) < 0.95 ? vec3(0., 1., 0.) : vec3(0., 0., 1.));
+    across = normalize(across);
+    normal = position.x * across + position.y * cross(along, across);
+    float t = position.z / ${SEG}.0;
+    vec3 spread = fiberStyle.z * across + fiberStyle.w * fiberNormal;
+    float lengthScale = mix(1.0, fiberStyle.y, step(1.5, curve.w));
+    float taper = mix(1.0, curve.w > 1.5 ? 0.20 : 0.88, t * t);
+    point = fiberRoot + rotateFiber(curve.xyz) * lengthScale + spread * frame.w * t * t + normal * taper * fiberStyle.x;
+  }
+`;
+function curveMaterial(material, depth = false) {
+  material.onBeforeCompile = shader => {
+    shader.uniforms.hairCurves = { value: curveMap };
+    shader.vertexShader = fiberSource + shader.vertexShader;
+    if (!depth) shader.vertexShader = shader.vertexShader.replace('#include <beginnormal_vertex>',
+      'vec3 fiberPoint, objectNormal; fiberVertex(fiberPoint, objectNormal);');
+    shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', depth
+      ? 'vec3 transformed, fiberNormal; fiberVertex(transformed, fiberNormal);'
+      : 'vec3 transformed = fiberPoint;');
+  };
+  return material;
+}
+const coatMat = curveMaterial(new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.66, sheen: 0.45, sheenRoughness: 0.72, sheenColor: 0x906647 }));
+const hair = new THREE.Mesh(fiberGeo, coatMat);
+hair.customDepthMaterial = curveMaterial(new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking }), true);
+hair.castShadow = true;
+hair.frustumCulled = false;
+scene.add(hair);
+
+function paint(F) {
+  for (let i = 0; i < fibers.length; i++) {
+    const { cell, shade } = fibers[i], score = F.scores[cell];
+    col.copy(BROWN).multiplyScalar(shade).lerp(score < 0 ? RED : GREEN, tint ? Math.abs(score) * 0.85 : 0);
+    col.toArray(tints.array, i * 3);
+  }
+  tints.needsUpdate = true;
+}
+
+function pointAt(points, L, arc, out) { // sample along the strand, from the root
+  const t = arc * SEG / L, i = Math.min(Math.floor(t), SEG - 1);
+  return out.copy(points[i]).lerp(points[i + 1], t - i);
+}
+function setLength(s, length, falls, reset) {
+  // Close cuts keep their relative measured lengths. Only longer hair gets the extra drape.
+  const long = smooth(length, 0.19, uncut[s.cell]);
+  const L = length * BUZZ_SCALE + long * (s.groomLength - uncut[s.cell] * BUZZ_SCALE);
+  if (L === s.L && !reset) return;
+  if (falls && L < s.L) spawnClip(s, L);
+  if (!reset && L < s.L && L >= 0.13) { // keep the shape and momentum of the remaining stub
+    // Source indices never exceed the destination index, so work backwards in place.
+    for (let i = SEG; i > 0; i--) {
+      pointAt(s.p, s.L, i * L / SEG, tmp); s.p[i].copy(tmp);
+      pointAt(s.o, s.L, i * L / SEG, tmp); s.o[i].copy(tmp);
+    }
+  } else {
+    s.p[0].copy(s.root);
+    for (let i = 1; i <= SEG; i++) {
+      s.p[i].copy(s.p[i - 1]).addScaledVector(L < 0.13 ? s.stub : s.rest[i - 1], L / SEG);
+    }
+    s.p.forEach((pt, i) => s.o[i].copy(pt));
+  }
+  s.L = L;
+  s.still = 0;
+  s.dirty = true;
+}
+function uploadHair() {
+  let changed = false;
+  for (const s of guides) {
+    if (!s.dirty) continue;
+    const mode = s.L < 0.004 ? 0 : s.L > 0.20 ? 2 : 1;
+    for (let i = 0; i <= SEG; i++) {
+      const k = (s.i * curveWidth + i * 2) * 4;
+      tmp.copy(s.p[i]).sub(s.root).toArray(curveData, k);
+      curveData[k + 3] = mode;
+      tmp.copy(s.p[Math.min(i + 1, SEG)]).sub(s.p[Math.max(i - 1, 0)]).normalize().toArray(curveData, k + 4);
+      curveData[k + 7] = s.L;
+    }
+    s.dirty = false;
+    changed = true;
+  }
+  if (changed) curveMap.needsUpdate = true;
+}
+
+const TICK = 1 / 60, PASSES = 4;
+const bladePrev = V(), bladeNow = V(), bladeAxis = V(), bladePrevAxis = V(), bladeMove = V(), bladeAcross = V();
+const bladeClosest = V(), bladeSample = V(), sampleAxis = V(), clipPush = V();
+function collideBlade(p, radius) {
+  // Project onto the swept blade, then clamp to the blade's actual width.
+  const move2 = bladeAcross.lengthSq();
+  const t = move2 > 1e-7 ? THREE.MathUtils.clamp(clipPush.copy(p).sub(bladePrev).dot(bladeAcross) / move2, 0, 1) : 1;
+  bladeSample.copy(bladePrev).addScaledVector(bladeMove, t);
+  sampleAxis.copy(bladePrevAxis).lerp(bladeAxis, t).normalize();
+  bladeClosest.copy(bladeSample).addScaledVector(sampleAxis, THREE.MathUtils.clamp(clipPush.copy(p).sub(bladeSample).dot(sampleAxis), -0.14, 0.14));
+  clipPush.copy(p).sub(bladeClosest);
+  const d = clipPush.length();
+  if (d < radius) {
+    if (d > 1e-6) p.addScaledVector(clipPush, (radius - d) / d);
+    else p.addScaledVector(UP, radius);
+  }
+}
+function collideScalp(p) {
+  const r = p.length();
+  const skin = portraitRadius(dir.copy(p).divideScalar(r || 1)) + 0.004;
+  if (r < skin) p.copy(dir).multiplyScalar(skin);
+  if (p.y < -0.78) {
+    const nx = p.x, nz = p.z + 0.08, nr = Math.hypot(nx, nz);
+    if (nr < 0.47 && nr > 1e-6) { p.x = nx / nr * 0.47; p.z = nz / nr * 0.47 - 0.08; }
+  }
+  const cape = tmp.copy(p).sub(CAPE_C).divide(CAPE_R);
+  const e = cape.length();
+  if (e < 1 && e > 1e-6) p.copy(cape).divideScalar(e).multiply(CAPE_R).add(CAPE_C);
+}
+function simulateHair(tool = false) {
+  bladeMove.copy(bladeNow).sub(bladePrev);
+  tangent(bladeAcross.copy(bladeMove), bladeAxis);
+  const sweep = bladeMove.lengthSq();
+  for (const s of guides) {
+    const L = s.L;
+    if (L < 0.004) continue;
+    // Coarse bounds let settled guides sleep and keep most strands out of the blade solver.
+    const t = tool && sweep > 1e-7 ? THREE.MathUtils.clamp(tmp.copy(s.root).sub(bladePrev).dot(bladeMove) / sweep, 0, 1) : 1;
+    const near = tool && s.root.distanceToSquared(tmp.copy(bladePrev).addScaledVector(bladeMove, t)) < (L + 0.22) ** 2;
+    if (s.still > 24 && !near) continue;
+    const seg = L / SEG;
+    for (let i = 1; i <= SEG; i++) {
+      const p = s.p[i], o = s.o[i];
+      tmp.copy(p).sub(o).multiplyScalar(0.88);
+      o.copy(p);
+      p.add(tmp);
+      p.y -= (L < 0.13 ? 0.18 : 7) * TICK * TICK;
+    }
+    for (let pass = 0; pass < PASSES; pass++) {
+      for (let i = 1; i <= SEG; i++) {
+        const p = s.p[i], parent = s.p[i - 1];
+        // Protect the root orientation and the groomed bend, with more give towards the tip.
+        const short = L < 0.13;
+        const bend = short ? 0.72 : i === 1 ? 0.58 : i === 2 ? 0.25 : 0.16;
+        p.lerp(a.copy(parent).addScaledVector(short ? s.stub : s.rest[i - 1], seg), bend);
+        const edge = a.copy(p).sub(parent), d = edge.length();
+        if (d > 1e-8) {
+          const correction = (d - seg) / d;
+          p.addScaledVector(edge, -correction * (i === 1 ? 1 : 0.6));
+          if (i > 1) parent.addScaledVector(edge, correction * 0.4);
+        }
+        if (near) collideBlade(p, 0.054);
+      }
+      for (let i = 1; i <= SEG; i++) collideScalp(s.p[i]);
+    }
+    let moved = 0;
+    for (let i = 1; i <= SEG; i++) moved = Math.max(moved, s.p[i].distanceToSquared(s.o[i]));
+    s.still = moved < 2e-8 ? s.still + 1 : 0;
+    s.dirty = true;
+  }
+  if (tool) { bladePrev.copy(bladeNow); bladePrevAxis.copy(bladeAxis); }
+}
+
+// ---------- clippings: what the blade cuts off keeps its curl, falls, tumbles and settles ----------
+const MAXC = 5000, clipData = [];
+const clips = new THREE.InstancedMesh(strandGeo, hairMat, MAXC * CSEG);
+clips.count = 0;
+clips.castShadow = true;
+clips.frustumCulled = false;
+scene.add(clips);
+let clipNext = 0;
+function spawnClip(s, newL) {
+  const cut = s.L - newL;
+  if (cut < 0.015) return;
+  const i = clipNext++ % MAXC;
+  const c = clipData[i] ??= { p: V(), v: V(), w: V(), q: new THREE.Quaternion(), shape: Array.from({ length: CSEG }, () => new THREE.Matrix4()) };
+  const pts = Array.from({ length: CSEG + 1 }, (_, j) => pointAt(s.p, s.L, newL + cut * j / CSEG, V()));
+  c.p.copy(pts[0]).add(pts[CSEG]).multiplyScalar(0.5);
+  c.q.setFromUnitVectors(UP, dir.copy(pts[CSEG]).sub(pts[0]).normalize());
+  const inv = c.q.clone().invert();
+  pts.forEach(pt => pt.sub(c.p).applyQuaternion(inv));  // the cut piece, in its own frame
+  for (let j = 0; j < CSEG; j++) {
+    dir.copy(pts[j + 1]).sub(pts[j]);
+    c.shape[j].compose(pts[j], q.setFromUnitVectors(UP, a.copy(dir).normalize()), sc.set(0.8, dir.length(), 0.8));
+    clips.setColorAt(i * CSEG + j, col.copy(BROWN).multiplyScalar(s.shade)); // clippings keep the hair's own colour
+  }
+  c.v.copy(s.p[SEG]).sub(s.o[SEG]).multiplyScalar(1 / TICK)
+    .addScaledVector(s.n, 0.15 + Math.random() * 0.35)
+    .addScaledVector(tipVel, 0.22).add(tmp.set(rnd(0.5), rnd(0.3), rnd(0.5)));
+  c.w.set(rnd(5), rnd(5), rnd(5));
+  c.live = true;
+  clips.instanceColor.needsUpdate = true;
+  clips.count = Math.min(clipNext, MAXC) * CSEG;
+}
+function settle(c, n) { // lie flat on whatever it landed on
+  a.set(0, 1, 0).applyQuaternion(c.q);
+  tangent(a, n);
+  if (a.lengthSq() < 1e-6) tangent(a.set(1, 0, 0), n);
+  c.q.setFromUnitVectors(UP, a.normalize());
+  c.live = false;
+}
+function simulateClips(dt) {
+  let moved = false;
+  for (let i = 0; i < clips.count / CSEG; i++) {
+    const c = clipData[i];
+    if (!c.live) continue;
+    moved = true;
+    c.v.y -= 9 * dt;                                   // gravity, then air drag and flutter: hair is light
+    c.v.multiplyScalar(Math.exp(-2.2 * dt));
+    c.v.x += rnd(2.5) * dt;
+    c.v.z += rnd(2.5) * dt;
+    c.p.addScaledVector(c.v, dt);
+    const spin = c.w.length() * dt;
+    if (spin > 1e-5) c.q.premultiply(q.setFromAxisAngle(tmp.copy(c.w).normalize(), spin));
+    const r = c.p.length(), skin = portraitRadius(dir.copy(c.p).divideScalar(r || 1)) + 0.03;
+    if (r < skin) {                                    // slide off the head
+      c.p.copy(dir).multiplyScalar(skin);
+      const vn = c.v.dot(dir);
+      if (vn < 0) c.v.addScaledVector(dir, -vn);
+      c.v.multiplyScalar(0.97);
+    }
+    const e = tmp.copy(c.p).sub(CAPE_C).divide(CAPE_R).length();
+    if (e < 1) {                                       // land on the cape, or slide down its sides
+      nrm.copy(tmp).divide(CAPE_R).normalize();
+      c.p.copy(tmp).divideScalar(e).multiply(CAPE_R).add(CAPE_C).addScaledVector(nrm, 0.008);
+      const vn = c.v.dot(nrm);
+      if (vn < 0) c.v.addScaledVector(nrm, -vn);
+      c.v.multiplyScalar(0.9);
+      c.w.multiplyScalar(0.8);
+      if (nrm.y > 0.8) settle(c, nrm);
+    }
+    if (c.p.y < FLOOR + 0.012) { c.p.y = FLOOR + 0.012; settle(c, UP); }
+    for (let j = 0; j < CSEG; j++) clips.setMatrixAt(i * CSEG + j, m.compose(c.p, c.q, ONE).multiply(c.shape[j]));
+  }
+  if (moved) clips.instanceMatrix.needsUpdate = true;
+}
+
+// ---------- robot arm: drawn through the joint positions the environment reports ----------
+const paint_ = std(0xe8762c, 0.35, 0.1), joint = std(0x23262c, 0.4, 0.6), steel = std(0xdfe5ec, 0.22, 1);
+const armNow = R.frames[0].arm.map(p => V(...p)), armGoal = armNow.map(p => p.clone());
+const tip = armNow[3], tipVel = V(), tipWas = V();
+const shoulder = armNow[0];
+part(new THREE.CylinderGeometry(0.2, 0.26, shoulder.y - FLOOR, 32), joint, V(shoulder.x, (shoulder.y + FLOOR) / 2, shoulder.z)); // pedestal
+part(new THREE.CylinderGeometry(0.7, 0.75, 0.08, 48), joint, V(shoulder.x, FLOOR + 0.04, shoulder.z));
+part(new THREE.CylinderGeometry(0.27, 0.27, 0.34, 32), paint_, shoulder);
+const hinge = new THREE.CylinderGeometry(1, 1, 1, 24).rotateZ(Math.PI / 2); // axis across the arm's plane
+const links = [0, 1, 2].map(i => {
+  const g = new THREE.Group();
+  if (i < 2) {
+    part(new THREE.CylinderGeometry(i ? 0.085 : 0.1, i ? 0.1 : 0.12, 1, 24).translate(0, 0.5, 0), paint_, V(), null, g).name = 'beam';
+    part(hinge, joint, V(), V(0.36, i ? 0.15 : 0.18, i ? 0.15 : 0.18), g);
+  } else {                                                    // the clipper: slim handle, head, and the blade at the very tip
+    part(hinge, joint, V(), V(0.3, 0.11, 0.11), g);
+    part(new THREE.CylinderGeometry(0.035, 0.05, 0.54, 16).translate(0, 0.27, 0), joint, V(), null, g);
+    part(new THREE.BoxGeometry(0.26, 0.055, 0.075), std(0x2f6fed, 0.4, 0.2), V(0, 0.565, 0), null, g);
+    part(new THREE.BoxGeometry(0.28, 0.008, 0.09), steel, V(0, 0.596, 0), null, g);
+  }
+  scene.add(g);
+  return g;
+});
+const ax = V(), ay = V(), az = V(), side = V(1, 0, 0);
+function poseArm() {
+  a.set(tip.x - shoulder.x, 0, tip.z - shoulder.z);
+  if (a.lengthSq() > 1e-6) side.set(a.z, 0, -a.x).normalize(); // across the plane the arm bends in
+  links.forEach((g, i) => {
+    ay.copy(armNow[i + 1]).sub(armNow[i]);
+    const len = ay.length();
+    ay.divideScalar(len);
+    az.crossVectors(side, ay).normalize();
+    ax.crossVectors(ay, az);
+    g.quaternion.setFromRotationMatrix(m.makeBasis(ax, ay, az));
+    g.position.copy(armNow[i]);
+    const beam = g.getObjectByName('beam');
+    if (beam) beam.scale.y = len;
+  });
+}
+
+// ---------- the two RGB cameras ----------
+const EYE = 5.2, eyeGoal = V();
+const orbitCam = new THREE.PerspectiveCamera(44, 4 / 3, 0.1, 60);
+const bladeCam = new THREE.PerspectiveCamera(68, 4 / 3, 0.025, 30);
+const camBody = new THREE.Group();
+part(new THREE.BoxGeometry(0.34, 0.22, 0.24), joint, V(), null, camBody);
+part(new THREE.CylinderGeometry(0.075, 0.095, 0.18, 24).rotateX(Math.PI / 2), std(0x0d0f12, 0.15, 0.8), V(0, 0, 0.2), null, camBody);
+part(ball, new THREE.MeshBasicMaterial({ color: 0xff3b30 }), V(0.12, 0.08, 0.125), V(0.016, 0.016, 0.016), camBody);
+camBody.traverse(o => { o.castShadow = false; });
+scene.add(camBody);
+const bladeBody = new THREE.Group();
+part(new THREE.BoxGeometry(0.11, 0.11, 0.10), joint, V(), null, bladeBody).castShadow = false;
+part(ball, steel, V(0, 0.058, 0), V(0.036, 0.02, 0.036), bladeBody).castShadow = false;
+scene.add(bladeBody);
+const bladeMount = V(0.37, 1.75, 0.25); // nominal lens position relative to the forearm
+const bladeOutward = V(), bladeEyeRadial = V();
+const lensRotation = new THREE.Quaternion().setFromAxisAngle(V(1, 0, 0), -Math.PI / 2);
+// Leave space for the housing and the camera's near plane, even in a wide view.
+const BLADE_CAMERA_CLEARANCE = 0.11;
+const camAt = c => V(Math.cos(c[1]) * Math.sin(c[0]), Math.sin(c[1]), Math.cos(c[1]) * Math.cos(c[0])).multiplyScalar(EYE);
+orbitCam.position.copy(camAt(R.frames[0].cam));
+function aimCameras() {
+  orbitCam.lookAt(0, 0.45, 0);
+  camBody.position.copy(orbitCam.position);
+  camBody.lookAt(0, 0.45, 0);
+  links[1].localToWorld(bladeCam.position.copy(bladeMount));
+  bladeOutward.copy(tip).normalize();
+  if (bladeOutward.lengthSq() === 0) bladeOutward.copy(bladeCam.position).normalize();
+  if (bladeOutward.lengthSq() === 0) bladeOutward.copy(UP);
+  // Keep the lens on the outward side of the blade so it can see the cutting edge.
+  const ahead = bladeEyeRadial.copy(bladeCam.position).sub(tip).dot(bladeOutward);
+  bladeCam.position.addScaledVector(bladeOutward, Math.max(0, 0.18 - ahead));
+  bladeEyeRadial.copy(bladeCam.position).normalize();
+  const headRadius = Math.max(skinAt(bladeEyeRadial), portraitRadius(bladeEyeRadial));
+  if (bladeCam.position.length() < headRadius + BLADE_CAMERA_CLEARANCE) {
+    bladeCam.position.copy(bladeEyeRadial).multiplyScalar(headRadius + BLADE_CAMERA_CLEARANCE);
+  }
+  bladeCam.lookAt(tip);
+  bladeBody.quaternion.copy(bladeCam.quaternion).multiply(lensRotation);
+  bladeBody.position.copy(bladeCam.position).addScaledVector(bladeEyeRadial.copy(UP).applyQuaternion(bladeBody.quaternion), -0.07);
+}
+let agentView = 0;
+
+const nickMat = new THREE.MeshBasicMaterial({ color: 0xff2d2d }), nickMarks = new Map();
+
+// ---------- showing a step ----------
+const hud = document.getElementById('hud'), slider = document.getElementById('t'), button = document.getElementById('play');
+const feeds = document.getElementById('feeds'), viewLabel = document.getElementById('view-label');
+const orbitFeed = document.getElementById('orbit-feed'), bladeFeed = document.getElementById('blade-feed');
+let k = -1, playing = !LIVE, acc = 0, then = performance.now(), note = '', hairClock = 0;
+const last = () => R.frames.length - 1;
+
+function show(step, animateCut = true) {
+  const F = R.frames[step], falls = animateCut && k >= 0 && step === k + 1;      // only a single step forward drops clippings
+  const seek = step !== k && !falls;
+  if (seek) { clips.count = 0; clipNext = 0; }
+  for (const s of guides) setLength(s, F.len[s.cell], falls, seek);
+  shadeScalp(F.len);
+  if (seek) {
+    armNow.forEach((p, i) => p.set(...F.arm[i]));
+    poseArm();
+    bladePrev.copy(tip);
+    bladePrevAxis.copy(ax);
+    tipVel.set(0, 0, 0);
+    relaxHair();
+  }
+  k = step;
+  if (tint) paint(F);
+  R.frames.forEach((f, i) => {
+    if (!f.nick) return;
+    if (!nickMarks.has(i)) {
+      const mark = new THREE.Mesh(new THREE.SphereGeometry(0.045, 12, 8), nickMat);
+      mark.position.copy(on(...f.arm[3]));
+      scene.add(mark);
+      nickMarks.set(i, mark);
+    }
+    nickMarks.get(i).visible = i <= k;
+  });
+  F.arm.forEach((p, i) => armGoal[i].set(...p));
+  eyeGoal.copy(camAt(F.cam));
+  if (seek) orbitCam.position.copy(eyeGoal);
+  slider.max = last();
+  slider.value = k;
+  hud.innerHTML = `step ${k}/${last()}   ${F.left} left   ${F.a}\n` +
+    (R.vision ? `target ${R.target}\n` :
+      `camera reads gap ${F.gap === null ? '-- (blade hidden)' : F.gap.toFixed(3)}   ${F.cell === null ? 'over bare skin' : 'over cell ' + F.cell}   target ${R.target}\n`) +
+    `nicks ${F.nicks}   score ${F.score.toFixed(3)}${F.over ? '   episode over' : ''}\n` +
+    (note ? `<b>${note}</b>\n` : '') + '<small>' +
+    (LIVE ? 'arrows = slide blade along the scalp   W/S = lift / lower   click the head = go there   shift = fine\n' +
+            '1-8 = turn joints one at a time   J/L I/K = aim the camera   space = cut   enter = done   N = new head\n'
+          : 'space = play/pause   arrows = step\n') +
+    'drag = orbit your view   V = cycle camera views   C = colour hair by score   T = show target length   red dot = nick</small>';
+}
+
+// ---------- replay controls ----------
+function setPlaying(on) {
+  if (on && k === last()) show(0);
+  playing = on;
+  acc = 0;
+  if (!LIVE) button.textContent = on ? 'pause' : 'play';
+}
+
+// ---------- live controls: every key becomes environment actions ----------
+let chain = Promise.resolve();
+const queue = job => { chain = chain.then(job); };
+const post = async (path, body) => (await fetch(path, { method: 'POST', body })).json();
+async function act(action) {
+  const res = await post('/step', action);
+  note = res.error ?? '';
+  if (!res.error) R.frames.push(res);
+  show(last());
+  return !res.error;
+}
+const here = () => V(...R.frames[last()].arm[3]);
+async function reach(p) { // pendant-style jog: the server works out which joints to turn, then it is an ordinary move
+  const res = await post('/reach', `${p.x} ${p.y} ${p.z}`);
+  if (res.error) { note = res.error; show(last()); return false; }
+  return act(res.action);
+}
+function slide(column, amount) { // along the scalp, in the camera's right (0) or up (1) direction
+  const p = here(), r = p.length(), n = p.clone().normalize();
+  const t = tangent(V().setFromMatrixColumn(camera.matrixWorld, column), n);
+  return t.length() < 0.15 ? true : reach(p.addScaledVector(t.normalize(), amount).setLength(r));
+}
+function lift(amount) {
+  const p = here();
+  return reach(p.setLength(Math.max(0.05, p.length() + amount)));
+}
+async function goTo(target) { // round the head at the current height, as many moves as it takes
+  for (let i = 0; i < 30; i++) {
+    const p = here(), r = p.length(), n = p.clone().normalize(), angle = n.angleTo(target);
+    if (angle < 0.015) return;
+    const axis = V().crossVectors(n, target).normalize();
+    if (!await reach(n.applyAxisAngle(axis, Math.min(angle, 0.3 / r)).multiplyScalar(r))) return;
+  }
+}
+const turn = (j, amount) => act('move ' + [0, 1, 2, 3].map(i => i === j ? amount : 0).join(' '));
+function aim(dAz, dEl) {
+  const c = R.frames[last()].cam;
+  return act(`look ${(c[0] + dAz).toFixed(3)} ${(c[1] + dEl).toFixed(3)}`);
+}
+async function newHead() {
+  await post('/new', '');
+  location.reload();
+}
+
+addEventListener('keydown', e => {
+  const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (key === 'c') { tint = !tint; paint(R.frames[k]); return; }
+  if (key === 't' && shell) { shell.visible = !shell.visible; return; }
+  if (key === 'v') {
+    agentView = (agentView + 1) % 3;
+    feeds.hidden = agentView !== 0;
+    viewLabel.hidden = agentView === 0;
+    viewLabel.textContent = agentView === 1 ? orbitFeed.textContent : bladeFeed.textContent;
+    return;
+  }
+  if (!LIVE) {
+    if (key === ' ') { e.preventDefault(); setPlaying(!playing); }
+    if (key === 'ArrowRight') { setPlaying(false); show(Math.min(k + 1, last())); }
+    if (key === 'ArrowLeft') { setPlaying(false); show(Math.max(k - 1, 0)); }
+    return;
+  }
+  const size = e.shiftKey ? 0.02 : 0.1, rise = e.shiftKey ? 0.01 : 0.05, bend = e.shiftKey ? 0.02 : 0.1;
+  const digit = e.code.startsWith('Digit') ? +e.code[5] : 0; // 1/2 yaw, 3/4 shoulder, 5/6 elbow, 7/8 wrist
+  const job = digit >= 1 && digit <= 8 ? () => turn((digit - 1) >> 1, digit % 2 ? -bend : bend) : {
+    ArrowLeft: () => slide(0, -size), ArrowRight: () => slide(0, size), ArrowUp: () => slide(1, size), ArrowDown: () => slide(1, -size),
+    w: () => lift(rise), s: () => lift(-rise), ' ': () => act('cut'), Enter: () => act('done'), n: newHead,
+    j: () => aim(-0.3, 0), l: () => aim(0.3, 0), i: () => aim(0, 0.2), k: () => aim(0, -0.2),
+  }[key];
+  if (job) { e.preventDefault(); queue(job); }
+});
+let downAt = null;
+renderer.domElement.addEventListener('pointerdown', e => { downAt = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if (!LIVE || agentView || !downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5) return; // a drag orbits
+  const ray = new THREE.Raycaster();
+  ray.setFromCamera(new THREE.Vector2(e.clientX / innerWidth * 2 - 1, -e.clientY / innerHeight * 2 + 1), camera);
+  const hit = ray.intersectObject(head)[0]?.point ?? ray.ray.intersectSphere(new THREE.Sphere(V(), 1.4), V()); // the hair counts too
+  if (hit) queue(() => goTo(hit.normalize()));
+});
+// Blur after use, so space and the arrows are not also handled by the focused control.
+button.textContent = LIVE ? 'new head' : 'pause';
+button.onclick = () => { LIVE ? newHead() : setPlaying(!playing); button.blur(); };
+slider.oninput = () => { setPlaying(false); show(+slider.value, false); };
+slider.onchange = () => slider.blur();
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+show(LIVE ? last() : 0);
+paint(R.frames[k]);
+
+function relaxHair() {
+  for (let i = 0; i < 58; i++) simulateHair();
+  uploadHair();
+}
+
+function renderAgentView(view, x, y, w, h) {
+  view.aspect = w / h;
+  view.updateProjectionMatrix();
+  const housing = view === orbitCam ? camBody : bladeBody;
+  const showTarget = shell?.visible;
+  housing.visible = false;
+  if (shell) shell.visible = false;
+  renderer.setViewport(x, y, w, h);
+  renderer.setScissor(x, y, w, h);
+  renderer.render(scene, view);
+  housing.visible = true;
+  if (shell) shell.visible = showTarget;
+}
+function renderFeed(view, label) {
+  const { left, bottom, width, height } = label.getBoundingClientRect();
+  renderAgentView(view, left, innerHeight - bottom, width, height);
+}
+
+// The headless renderer captures only these two scene views at the exact pose of a step.
+if (CAPTURE) {
+  renderer.setPixelRatio(1);
+  renderer.setSize(512, 384);
+  globalThis.captureCameras = frame => {
+    guides.forEach(s => setLength(s, frame.len[s.cell], false, true));
+    shadeScalp(frame.len);
+    relaxHair();
+    armNow.forEach((p, i) => p.set(...frame.arm[i]));
+    poseArm();
+    orbitCam.position.copy(camAt(frame.cam));
+    aimCameras();
+    renderer.shadowMap.needsUpdate = true;
+    const photo = view => {
+      renderAgentView(view, 0, 0, 512, 384);
+      return renderer.domElement.toDataURL('image/jpeg', 0.9);
+    };
+    return { orbit: photo(orbitCam), blade: photo(bladeCam) };
+  };
+}
+renderer.setScissorTest(true);
+renderer.shadowMap.autoUpdate = false; // share one shadow pass between the camera views
+if (!CAPTURE) renderer.setAnimationLoop(now => {
+  const dt = Math.min((now - then) / 1000, 0.05), ease = 1 - Math.exp(-dt * 18);
+  then = now;
+  if (playing) {
+    acc += dt * SPEED;
+    if (acc >= 1) { acc -= 1; show(Math.min(k + 1, last())); }
+    if (k === last()) setPlaying(false);
+  }
+  tipWas.copy(tip);
+  armNow.forEach((p, i) => p.lerp(armGoal[i], ease));
+  tipVel.copy(tip).sub(tipWas).divideScalar(Math.max(dt, 1e-3));
+  poseArm();
+  orbitCam.position.lerp(eyeGoal, 1 - Math.exp(-dt * 6)).setLength(EYE);
+  aimCameras();
+  hairClock = Math.min(hairClock + dt, 3 * TICK);
+  const ticks = Math.floor(hairClock / TICK);
+  for (let i = 0; i < ticks; i++) {
+    bladeNow.copy(bladePrev).lerp(tip, 1 / (ticks - i));
+    bladeAxis.copy(bladePrevAxis).lerp(ax, 1 / (ticks - i)).normalize();
+    simulateHair(true);
+    hairClock -= TICK;
+  }
+  if (ticks) uploadHair();
+  simulateClips(dt);
+  controls.update();
+  renderer.shadowMap.needsUpdate = true;
+  if (agentView) renderAgentView(agentView === 1 ? orbitCam : bladeCam, 0, 0, innerWidth, innerHeight);
+  else {
+    renderer.setViewport(0, 0, innerWidth, innerHeight);
+    renderer.setScissor(0, 0, innerWidth, innerHeight);
+    renderer.render(scene, camera);
+    renderFeed(orbitCam, orbitFeed);
+    renderFeed(bladeCam, bladeFeed);
+  }
+});
+</script>
+</body>
+</html>

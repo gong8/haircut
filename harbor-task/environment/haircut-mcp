@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+cd /var/lib/haircut
+exec env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    python3 /opt/haircut/haircut.py mcp 6

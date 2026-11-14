@@ -1,0 +1,8 @@
+{
+  "name": "haircut-vision",
+  "private": true,
+  "dependencies": {
+    "playwright": "1.65.0",
+    "three": "0.187.0"
+  }
+}
